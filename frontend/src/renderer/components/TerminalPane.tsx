@@ -61,6 +61,7 @@ export function preloadXtermTerminal(): void {
 import { RestoreUnavailableDialog } from "./RestoreUnavailableDialog";
 import { rememberPaneTerminalGrid } from "../lib/terminal-grid-hint";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { captureRendererException } from "../lib/telemetry";
 
 type TerminalPaneProps = {
 	session?: WorkspaceSession;
@@ -1287,6 +1288,7 @@ function AttachedTerminal({
 	}, [onTerminalReady, terminal]);
 	const handleInitError = useCallback((err: unknown) => {
 		console.error("xterm failed to initialize", err);
+		void captureRendererException(err, { source: "terminal-init", operation: "xterm_init" });
 		setInitFailed(true);
 	}, []);
 	useEffect(() => {
