@@ -23,6 +23,7 @@ import { useTabListTabStop } from "../../hooks/useTabListTabStop";
 
 import {
 	memo,
+	useContext,
 	useCallback,
 	useEffect,
 	useLayoutEffect,
@@ -39,17 +40,18 @@ import {
 	type ReactNode,
 	type WheelEvent as ReactWheelEvent,
 } from "react";
-import { ArrowDown, Columns2, FlaskConical, ListTodo, Loader2, MessageSquarePlus, NotebookPen, Presentation, Route, ScanSearch, TriangleAlert, Undo2, WandSparkles } from "lucide-react";
+import { ArrowDown, Columns2, FlaskConical, ListTodo, Loader2, NotebookPen, Presentation, Route, ScanSearch, TriangleAlert, Undo2, WandSparkles } from "lucide-react";
 import { AnimatePresence, motion, Reorder, useReducedMotion } from "motion/react";
 import { useTranslation } from "react-i18next";
-import { useChatSelectionPosition } from "../../hooks/useChatSelectionPosition";
-import { actionMenuContentClass, actionMenuItemClass } from "../ui/menu-styles";
+import { ChatSelectionActions } from "./ChatSelectionActions";
+import { selectionRangesEqual } from "../../lib/selection-toolbar";
 import { useScrollFollow } from "../../hooks/useScrollFollow";
 import {
 	defaultRangeExtractor,
 	measureElement,
 	observeElementRect,
 	useVirtualizer,
+	type Virtualizer,
 } from "@tanstack/react-virtual";
 import { cn } from "../../lib/utils";
 import { sessionBranchPresentation } from "../../lib/session-branch";
@@ -111,6 +113,7 @@ import { DraggableWorkspaceTab, SessionPaneTab } from "../CenterPane";
 import { Button } from "../ui/button";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { SessionTopbarPortal } from "../SessionTopbarPortal";
+import { SessionTabsTopbar } from "../PageTopbar";
 import { ShellTerminalTab } from "../ShellTerminalTab";
 import { TerminalPane } from "../TerminalPane";
 import {
@@ -340,7 +343,10 @@ function useQueuedMessages(snapshot: ConversationSnapshot, excludeTurnId?: strin
 
 export interface ChatWorkspaceProps {
 	onAddToSideChat?: (excerpt: ChatDraftExcerptReference) => void | Promise<void>;
+	checkingSideChatAvailability?: boolean;
 	annotationNavigationRequest?: { id: string; text: string; messageId?: string; revision?: number };
+	/** Called once the chat applied annotationNavigationRequest, so its owner drops it rather than have a later mount replay it. */
+	onAnnotationNavigationHandled?: (id: string) => void;
 	snapshot: ConversationSnapshot;
 	promptSuggestion?: ComposerPromptSuggestion;
 	/** Renderer-owned state identity; the snapshot's sessionId remains the daemon wire ID. */
@@ -421,6 +427,8 @@ export interface ChatWorkspaceProps {
 		clientMessageId?: string,
 		excerpts?: ChatDraftExcerptReference[],
 		fileReferences?: ChatFileReference[],
+		/** With text delivery, the message as typed, before its file captures were inlined into `text`. */
+		displayText?: string,
 	) => void | Promise<unknown>;
 	onDecide?: (requestId: string, decisionId: string) => void;
 	onResolveInput?: (
@@ -544,6 +552,10 @@ export interface ChatWorkspaceProps {
 	skills?: ChatSkill[];
 	/** Worktree paths offered for `@`. */
 	filePaths?: string[];
+	/** Told what follows "@" in the composer, for files that are searched rather than listed (see ChatComposer). */
+	onFileQuery?: (query: string) => void;
+	/** Something the chat will run in is still starting (a Cloud sandbox started ahead of the brief): the composer shows it. */
+	composerStarting?: boolean;
 	/** The path list was capped by the daemon rather than being all of them. */
 	filePathsTruncated?: boolean;
 	/** Renderer-only human messages awaiting their exact durable counterpart. */
@@ -553,7 +565,9 @@ export interface ChatWorkspaceProps {
 	 * can open. Absent means no attach control is offered — the fixture preview has
 	 * no worktree to write into.
 	 */
-	onStageAttachments?: (attachments: { mimeType: string; data: string }[]) => Promise<string[]>;
+	onStageAttachments?: (attachments: { mimeType: string; data: string; name?: string }[], signal?: AbortSignal) => Promise<string[]>;
+	/** Staged files are uploaded to AO Cloud, up to maxBytes each; see ChatComposer. */
+	cloudAttachments?: { maxBytes: number };
 	/** The provider negotiated native image prompt blocks. */
 	nativeImages?: boolean;
 	/**
@@ -682,7 +696,9 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
 
 function ChatWorkspaceContent({
 	onAddToSideChat,
+	checkingSideChatAvailability,
 	annotationNavigationRequest,
+	onAnnotationNavigationHandled,
 	snapshot,
 	promptSuggestion,
 	sessionTitle,
@@ -785,8 +801,11 @@ function ChatWorkspaceContent({
 	skills,
 	filePaths,
 	filePathsTruncated,
+	onFileQuery,
+	composerStarting = false,
 	localEchos,
 	onStageAttachments,
+	cloudAttachments,
 	nativeImages,
 	onSteer,
 	showSteerButton,
@@ -1146,7 +1165,7 @@ function ChatWorkspaceContent({
 	// Keep the dispatch target with this composer instance while attachment staging
 	// awaits. A newer queue editor must not redirect an older ordinary send.
 	const handleComposerSend = useCallback(
-		async (text: string, attachments?: Parameters<NonNullable<typeof onSend>>[1], clientMessageId?: string, retainedContent?: number[], excerpts?: ChatDraftExcerptReference[], fileReferences?: ChatFileReference[]) => {
+		async (text: string, attachments?: Parameters<NonNullable<typeof onSend>>[1], clientMessageId?: string, retainedContent?: number[], excerpts?: ChatDraftExcerptReference[], fileReferences?: ChatFileReference[], displayText?: string) => {
 			if (queueEdit) {
 				if (!onEditQueuedTurn) {
 					throw new Error("chat.draft.queueUnavailable");
@@ -1197,7 +1216,7 @@ function ChatWorkspaceContent({
 			if (wasConversationEmpty.current && composerBoxRef.current) {
 				composerCenteredTopRef.current = composerBoxRef.current.getBoundingClientRect().top;
 			}
-			return onSend?.(text, attachments, clientMessageId, excerpts, fileReferences);
+			return onSend?.(text, attachments, clientMessageId, excerpts, fileReferences, displayText);
 		},
 		[draftScope, onEditQueuedTurn, onSend, nativeImages, queueEdit, queuedMessages, updateQueueDraft],
 	);
@@ -1273,7 +1292,13 @@ function ChatWorkspaceContent({
 	const navigateToAnnotation = useCallback((annotation: { text: string; messageId?: string; revision?: number }) => {
 		annotationNavigationRef.current?.(annotation);
 	}, []);
-	useEffect(() => { if (annotationNavigationRequest) navigateToAnnotation(annotationNavigationRequest); }, [annotationNavigationRequest, navigateToAnnotation]);
+	// This content remounts per session (it is keyed by the draft scope), so a
+	// request still held after it applied would apply again to the next chat.
+	useEffect(() => {
+		if (!annotationNavigationRequest) return;
+		navigateToAnnotation(annotationNavigationRequest);
+		onAnnotationNavigationHandled?.(annotationNavigationRequest.id);
+	}, [annotationNavigationRequest, navigateToAnnotation, onAnnotationNavigationHandled]);
 	// Storage failures can be transient, so try again when the user comes back. Only while
 	// the composer is empty: recovering remounts it, which would drop unsaved text.
 	useEffect(() => {
@@ -1458,7 +1483,16 @@ function ChatWorkspaceContent({
 	// Claude Code compacts at the window picked for it, well before its model's full context.
 	const compactsAt = snapshot.harness === "claude-code" ? snapshot.settings?.autoCompactWindow : undefined;
 	const stableUsage = useStableValue(snapshot.usage);
-	const stableModelReroute = useStableValue(snapshot.modelReroute);
+	// A reroute describes the model it was recorded against; once the user picks a
+	// different model it no longer says anything about the next turn.
+	const currentModelReroute =
+		snapshot.modelReroute &&
+		(!snapshot.modelReroute.fromModel ||
+			!snapshot.settings.model ||
+			snapshot.modelReroute.fromModel === snapshot.settings.model)
+			? snapshot.modelReroute
+			: undefined;
+	const stableModelReroute = useStableValue(currentModelReroute);
 	const stablePendingApproval = useStableValue(pendingApproval);
 	const stablePendingUserInput = useStableValue(pendingUserInput);
 	const composerSettings = useMemo(
@@ -1773,6 +1807,7 @@ function ChatWorkspaceContent({
 				onReorderAuxiliaryTabs={reorderAuxiliaryTabs}
 				inline={isFullscreen || inlineHeader}
 				slideIn={headerSlideIn}
+				fullscreen={isFullscreen}
 			/>}
 			<div className="relative flex min-h-0 flex-1 flex-col">
 				{reviewerTarget && session ? (
@@ -1837,6 +1872,7 @@ function ChatWorkspaceContent({
 					}
 					role="tabpanel"
 				>
+				<HoldWhileHidden hidden={reviewerActive || shellActive}>
 					{snapshot.account ? (
 						<ReauthBanner key={`${snapshot.sessionId}:${snapshot.conversationId}`} account={snapshot.account} harness={snapshot.harness}
 							hostId={activeRemoteHostId} cloud={Boolean(session?.cloud)} />
@@ -1886,6 +1922,7 @@ function ChatWorkspaceContent({
 
 								<Timeline
 							onAddToSideChat={onAddToSideChat}
+									checkingSideChatAvailability={checkingSideChatAvailability}
 									workerUpdates={sessionRole === "orchestrator"}
 									annotationNavigationRef={annotationNavigationRef}
 									key={draftScopeKey}
@@ -1917,6 +1954,9 @@ function ChatWorkspaceContent({
 									localEchos={localEchos}
 									startup={sessionRole === "orchestrator" ? undefined : startup}
 									openingStartedAt={openingStartedAt}
+									// A Freestyle Chat session started from this device: the row under its
+									// brief says the sandbox is still coming up until its worker connects.
+									openingStartupLabel={cloudStarting && openingStartedAt ? t("chat.startup.sandbox") : undefined}
 									arriving={arrivingInChat}
 								/>
 							</ChatHostId.Provider>
@@ -2028,7 +2068,7 @@ function ChatWorkspaceContent({
 												? t("chat.startup.queuePlaceholder", { agent: agentLabel(snapshot.harness) })
 												: undefined
 										}
-										starting={orchestratorStarting || arrivingInChat || cloudStarting}
+										starting={orchestratorStarting || arrivingInChat || cloudStarting || composerStarting}
 										disabled={(orchestratorBlocksComposer || (openingStarting && !session) || loadingQuietly || (snapshot.controller.state === "stopped" && !suppressStopped && (!resumingAgent || session?.provisionState === "failed")) || controllerTransitioning || newWorkDisabled || composerLockedPlaceholder !== undefined) && !queueEdit?.clientMessageId}
 										disabledPlaceholder={
 											composerLockedPlaceholder !== undefined
@@ -2056,7 +2096,9 @@ function ChatWorkspaceContent({
 										skills={skills}
 										filePaths={filePaths}
 										filePathsTruncated={filePathsTruncated}
+										onFileQuery={onFileQuery}
 										onStageAttachments={newWorkDisabled ? undefined : onStageAttachments}
+										cloudAttachments={cloudAttachments}
 										holdAttachments={newWorkDisabled ? undefined : holdAttachments}
 										onHeldAttachmentsChange={onHeldAttachmentsChange}
 										nativeImages={queueEdit?.clientMessageId ? queueEdit.nativeImages ?? nativeImages : nativeImages}
@@ -2088,6 +2130,7 @@ function ChatWorkspaceContent({
 							</div>
 						</div>
 					</div>
+				</HoldWhileHidden>
 				</div>
 			</div>
 
@@ -2248,6 +2291,18 @@ function readableItems(snapshot: ConversationSnapshot): ConversationItem[] {
 
 /* -------------------------------------------------------------------------- */
 
+// The conversation panel stays mounted (display:none, inert) while a terminal
+// or reviewer tab covers it. Re-rendering its timeline on every workspace
+// update while nobody can see it made opening a terminal re-render the whole
+// transcript. Hold it while hidden; it catches up when it is shown again.
+// Components inside still re-render on their own state and subscriptions.
+const HoldWhileHidden = memo(
+	function HoldWhileHidden({ children }: { hidden: boolean; children: ReactNode }) {
+		return <>{children}</>;
+	},
+	(_previous, next) => next.hidden,
+);
+
 function ChatHeader({
 	snapshot,
 	sessionTitle,
@@ -2271,6 +2326,7 @@ function ChatHeader({
 	onReorderAuxiliaryTabs,
 	inline,
 	slideIn = false,
+	fullscreen,
 	session,
 	onSessionRenamed,
 }: {
@@ -2302,6 +2358,7 @@ function ChatHeader({
 	/** Fullscreen content cannot see the normal topbar portal outside its subtree. */
 	inline?: boolean;
 	slideIn?: boolean;
+	fullscreen?: boolean;
 }) {
 	const { t } = useTranslation();
 	const sessionIsOrchestrator = session
@@ -2334,21 +2391,21 @@ function ChatHeader({
 	const clearanceRef = useSidebarChromeClearanceRef<HTMLDivElement>(isMac);
 	const tabListRef = useTabListTabStop<HTMLDivElement>();
 	const header = (
-		<header className={cn("flex h-inspector-tabs w-full shrink-0 items-stretch bg-sidebar", slideIn && "chat-header-slide-in")}>
-			<div
-				className="session-topbar-surface flex min-w-0 flex-1"
-				data-testid="session-workspace-topbar"
-			>
-				<div
-					className={cn(
-						"flex min-w-0 shrink items-stretch",
-						isMac && "session-topbar-titlebar-clearance-mac",
-						!isSidebarOpen && isLinux && "session-topbar-titlebar-clearance-linux",
-					)}
-					data-testid="session-terminal-region"
-					ref={clearanceRef}
-					style={{ width: "100%" }}
-				>
+		<SessionTabsTopbar
+			className={slideIn ? "chat-header-slide-in" : undefined}
+			fullscreen={fullscreen}
+			actions={
+				<>
+					{tabStripAction ? <div className="workspace-topbar-actions" data-testid="session-tab-strip-action">{tabStripAction}</div> : null}
+					{headerActions}
+				</>
+			}
+			clearanceClassName={cn(
+				isMac && "session-topbar-titlebar-clearance-mac",
+				!isSidebarOpen && isLinux && "session-topbar-titlebar-clearance-linux",
+			)}
+			clearanceRef={clearanceRef}
+			tabs={
 					<div
 						aria-label="Chat tabs"
 						className="flex h-full min-w-0 flex-1 items-stretch"
@@ -2423,16 +2480,8 @@ function ChatHeader({
 							{showRightFade ? <div aria-hidden="true" className="session-tab-scroll-fade" /> : null}
 						</div>
 					</div>
-				</div>
-				<div
-					className="ml-auto flex shrink-0 items-center gap-1 pl-2 pr-3"
-					data-testid="session-action-region"
-				>
-					{tabStripAction ? <div className="workspace-topbar-actions" data-testid="session-tab-strip-action">{tabStripAction}</div> : null}
-					{headerActions}
-				</div>
-			</div>
-		</header>
+			}
+		/>
 	);
 	return inline ? header : <SessionTopbarPortal>{header}</SessionTopbarPortal>;
 }
@@ -2618,6 +2667,7 @@ const CHAT_INITIAL_VIEWPORT_HEIGHT = 800;
  */
 export function Timeline({
 	onAddToSideChat,
+	checkingSideChatAvailability,
 	onAddToChat,
 	onForeignAnnotation,
 	annotationNavigationRef,
@@ -2651,8 +2701,10 @@ export function Timeline({
 	arriving = false,
 	workerUpdates = false,
 	openingStartedAt,
+	openingStartupLabel,
 }: {
 	onAddToSideChat?: ChatWorkspaceProps["onAddToSideChat"];
+	checkingSideChatAvailability?: boolean;
 	/** Replaces the default "Add to chat" (write to this draft scope's composer). */
 	onAddToChat?: (excerpt: ChatDraftExcerptReference) => void;
 	/** Handles annotations whose source is another conversation. */
@@ -2686,13 +2738,15 @@ export function Timeline({
 	rollbackDisabled?: boolean;
 	localEchos?: ConversationLocalEcho[];
 	/** A session that is starting, or failed to start, and its setup checklist. */
-	startup?: ComponentProps<typeof SessionStartup> & { openingTurnId?: string };
+	startup?: ComponentProps<typeof SessionStartup> & { openingTurnId?: string; label?: string };
 	/** An interface switch is bringing this conversation in; only then does the transcript fade in. */
 	arriving?: boolean;
 	/** Orchestrator chat: draw worker messages and reports as rows, and the orchestrator's handling under them. */
 	workerUpdates?: boolean;
 	/** When the brief that started this chat was sent; see ChatWorkspaceProps. */
 	openingStartedAt?: string;
+	/** Names the opening start in place of its timer while the sandbox comes up. */
+	openingStartupLabel?: string;
 }) {
 	const hasTranscript = snapshot.items.length > 0;
 	const arrivedEmpty = useRef(false);
@@ -2707,6 +2761,10 @@ export function Timeline({
 	const measuredVirtualGroups = useRef(new WeakSet<TimelineGroup>());
 	const pendingVirtualLayout = useRef(false);
 	const renderedVirtualHeight = useRef(0);
+	// Width reflow must settle in place, even when virtual measurements reach the
+	// DOM in a later commit. Smooth follow is reserved for conversation growth.
+	const viewportSize = useRef<{ width: number; height: number } | undefined>(undefined);
+	const viewportResize = useRef<{ anchor?: { key: string | number | bigint; offset: number } } | undefined>(undefined);
 	const promptSpacer = useRef<HTMLDivElement>(null);
 	const scrollTrack = useRef<HTMLDivElement>(null);
 	const drag = useRef<{
@@ -2757,9 +2815,12 @@ export function Timeline({
 		excerpt: ChatDraftExcerptReference;
 		range: Range;
 	} | null>(null);
-	const selectionButton = useRef<HTMLDivElement>(null);
 	const clearSelectionAction = useCallback(() => setSelectionAction(null), []);
-	const selectionPosition = useChatSelectionPosition(selectionAction?.range, scroller, selectionButton, clearSelectionAction);
+	const selectionActionRef = useRef(selectionAction);
+	selectionActionRef.current = selectionAction;
+	const dismissedSelection = useRef<typeof selectionAction>(null);
+	const dismissedEscapePress = useRef(false);
+	useEffect(() => { dismissedSelection.current = null; clearSelectionAction(); }, [snapshot.conversationId, clearSelectionAction]);
 	const [annotationTarget, setAnnotationTarget] = useState<{ text: string; messageId?: string; revision?: number }>();
 	const [annotationNavigationError, setAnnotationNavigationError] = useState<string>();
 	const annotationHighlightCleanup = useRef<(() => void) | undefined>(undefined);
@@ -2841,7 +2902,10 @@ export function Timeline({
 	const inlineEditSendBlocked =
 		inlineEditPending || (acceptedEditClearFailed && !durableInlineEditDelivery);
 
-	const captureTranscriptSelection = useCallback(() => {
+	const captureTranscriptSelection = useCallback((event?: Event) => {
+		if ((event?.target as Element | null)?.closest?.("[data-chat-selection-actions]")) return;
+		if (event instanceof KeyboardEvent && !/^(Arrow(Up|Down|Left|Right)|Home|End|PageUp|PageDown|Shift)$/i.test(event.key) &&
+			!((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a")) return;
 		const selection = window.getSelection();
 		if (!excerptsEnabled || !selection || selection.isCollapsed || selection.rangeCount === 0) {
 			setSelectionAction(null);
@@ -2875,18 +2939,68 @@ export function Timeline({
 			setSelectionAction(null);
 			return;
 		}
-		setSelectionAction({
+		const selectedRange = selection.getRangeAt(0).cloneRange();
+		const dismissed = dismissedSelection.current;
+		if (dismissed && dismissed.excerpt.messageId === messageId && dismissed.excerpt.revision === revision &&
+			dismissed.excerpt.text === text && selectionRangesEqual(dismissed.range, selectedRange)) return;
+		dismissedSelection.current = null;
+		const next = {
 			excerpt: {
 				id: crypto.randomUUID(),
 				conversationId: snapshot.conversationId,
 				messageId,
 				revision,
 				text,
-				role,
+				role: role as "user" | "assistant",
 			},
-			range: selection.getRangeAt(0).cloneRange(),
-		});
+			range: selectedRange,
+		};
+		setSelectionAction((previous) => previous && previous.excerpt.messageId === messageId &&
+			previous.excerpt.revision === revision && previous.excerpt.text === text && selectionRangesEqual(previous.range, selectedRange)
+			? previous : next);
 	}, [excerptsEnabled, snapshot.conversationId]);
+	useEffect(() => {
+		if (!excerptsEnabled) return;
+		const capture = (event: Event) => captureTranscriptSelection(event);
+		const selectionChanged = () => {
+			const current = window.getSelection();
+			if (!current || current.isCollapsed || !current.rangeCount || !selectionRangesEqual(current.getRangeAt(0), dismissedSelection.current?.range)) dismissedSelection.current = null;
+		};
+		const escape = (event: KeyboardEvent) => {
+			if (event.key !== "Escape" || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || isDialogOrMenuOpen()) return;
+			if (event.repeat && dismissedEscapePress.current) { event.preventDefault(); event.stopPropagation(); return; }
+			const origin = event.composedPath()[0];
+			const target = origin instanceof Element ? origin : document.activeElement;
+			if (target?.closest('input, textarea, select, [contenteditable], [role="textbox"], .xterm, webview, [data-browser-view]')) return;
+			const pane = scroller.current?.parentElement;
+			const toolbar = pane?.querySelector<HTMLElement>("[data-chat-selection-actions]");
+			const action = selectionActionRef.current;
+			if (!action || !toolbar || getComputedStyle(toolbar).visibility === "hidden" ||
+				(event.target instanceof Node && event.target !== document && event.target !== document.body && event.target !== document.documentElement && !pane?.contains(event.target))) return;
+			const native = window.getSelection();
+			if (!native?.rangeCount || native.isCollapsed || !selectionRangesEqual(native.getRangeAt(0), action.range)) return;
+			dismissedSelection.current = action;
+			dismissedEscapePress.current = true;
+			clearSelectionAction();
+			event.preventDefault(); event.stopPropagation();
+		};
+		const release = (event: KeyboardEvent) => { if (event.key === "Escape") dismissedEscapePress.current = false; };
+		document.addEventListener("selectionchange", selectionChanged);
+		document.addEventListener("keyup", release);
+		const blur = () => { dismissedEscapePress.current = false; };
+		window.addEventListener("blur", blur);
+		document.addEventListener("pointerup", capture);
+		document.addEventListener("keyup", capture);
+		document.addEventListener("keydown", escape, true);
+		return () => {
+			document.removeEventListener("pointerup", capture);
+			document.removeEventListener("keyup", capture);
+			document.removeEventListener("keydown", escape, true);
+			document.removeEventListener("selectionchange", selectionChanged);
+			document.removeEventListener("keyup", release);
+			window.removeEventListener("blur", blur);
+		};
+	}, [captureTranscriptSelection, clearSelectionAction, excerptsEnabled]);
 
 	const addSelectionToChat = useCallback(async () => {
 		if (!selectionAction) return;
@@ -3538,7 +3652,7 @@ export function Timeline({
 		const groups = groupByTurn({ ...snapshot, items: timelineItems })
 			.filter((group) => !group.turnId || !hiddenTurns.has(group.turnId))
 			.map((group, index) => openingPending && (firstTurn ? group.turnId === firstTurn.id : index === 0 && group.turnId?.startsWith("local:"))
-				? { ...group, live: true, liveStartedAt: openingStartedAt }
+				? { ...group, live: true, liveStartedAt: openingStartedAt, liveStartupLabel: openingStartupLabel }
 				: group);
 		if (!workerUpdates) return groups;
 		const spawnedIds = new Set(groups.flatMap((group) => spawnedSessionIds(group.items)));
@@ -3546,7 +3660,7 @@ export function Timeline({
 		return groups
 			.map((group) => ({ ...group, items: group.items.filter((item) => !isDuplicateSpawnAction(item, spawnedIds)) }))
 			.filter((group) => group.items.length > 0);
-	}, [openingPending, openingStartedAt, openingTurnId, snapshot, timelineItems, workerUpdates]);
+	}, [openingPending, openingStartedAt, openingStartupLabel, openingTurnId, snapshot, timelineItems, workerUpdates]);
 	const groups = useStableList(grouped, groupKey, sameGroup);
 	const workerUpdateIndex = useWorkerUpdateIndex(workerUpdates ? snapshot.items : undefined);
 	// One slot carries the start-up row from the first frame: the opening turn's
@@ -3556,7 +3670,7 @@ export function Timeline({
 	// its session reports any steps, so the row keeps its label through the handoff
 	// and the steps fill in under it.
 	const openingSetup = !startup && openingPending && turn?.state !== "running"
-		? { failed: false, steps: [], agentName: agentLabel(snapshot.harness) }
+		? { failed: false, steps: [], agentName: agentLabel(snapshot.harness), label: openingStartupLabel }
 		: undefined;
 	const rowStartup = startup ?? openingSetup;
 	const startupGroupKey = rowStartup && (openingSetup || showStartup)
@@ -3570,6 +3684,19 @@ export function Timeline({
 	const previews = useMemo(() => navigableGroups.map(groupPreview), [navigableGroups]);
 	const virtualized = groups.length > CHAT_VIRTUALIZE_THRESHOLD;
 	const virtualItemKey = useCallback((index: number) => groups[index]!.key, [groups]);
+	const captureViewportResize = useCallback((instance: Virtualizer<HTMLDivElement, Element>) => {
+		const node = instance.scrollElement;
+		if (!node) return;
+		const previous = viewportSize.current;
+		const next = { width: node.clientWidth, height: node.clientHeight };
+		if (previous && (previous.width !== next.width || previous.height !== next.height) && !viewportResize.current) {
+			const row = instance.getVirtualItemForOffset(node.scrollTop);
+			viewportResize.current = {
+				anchor: !pinnedRef.current && row ? { key: row.key, offset: row.start - node.scrollTop } : undefined,
+			};
+		}
+		viewportSize.current = next;
+	}, []);
 	const virtualizer = useVirtualizer({
 		// Scroll anchoring may notify during a layout effect; defer the React
 		// update rather than attempting a synchronous flush inside that effect.
@@ -3597,9 +3724,13 @@ export function Timeline({
 		// prompt spacer; the virtualizer's own follow would snap past both.
 		followOnAppend: false,
 		// Bootstrap unmeasurable panels until their real geometry is available.
-		observeElementRect: (instance, callback) => observeElementRect(instance, (rect) =>
-			callback(rect.height ? rect : { width: rect.width, height: CHAT_INITIAL_VIEWPORT_HEIGHT })),
+		observeElementRect: (instance, callback) => observeElementRect(instance, (rect) => {
+			captureViewportResize(instance);
+			callback(rect.height ? rect : { width: rect.width, height: CHAT_INITIAL_VIEWPORT_HEIGHT });
+		}),
 		measureElement: (element, entry, instance) => {
+			// Capture the old row positions before the first width remeasurement.
+			captureViewportResize(instance);
 			const group = groups[Number(element.getAttribute("data-index"))];
 			if (group && !measuredVirtualGroups.current.has(group)) {
 				measuredVirtualGroups.current.add(group);
@@ -3609,6 +3740,8 @@ export function Timeline({
 		},
 		scrollToFn: (offset, { adjustments = 0 }, instance) => {
 			if (!instance.scrollElement) return;
+			// A resize restores its anchor after the new row positions reach the DOM.
+			if (viewportResize.current) return;
 			// An instant write would abort our smooth glide (and land at a stale offset).
 			// Let the glide carry the adjustment: re-aim it at the new end instead. The
 			// next scroll event re-syncs the virtualizer's offset.
@@ -3831,13 +3964,14 @@ export function Timeline({
 	// over the first frames (and may arrive in more than one snapshot), so keep
 	// snapping briefly after the first real layout instead of animating across them.
 	const followOrSnapToEnd = useCallback((node: HTMLElement) => {
-		if (!initialLayoutDone.current || performance.now() - initialLayoutAt.current < INITIAL_SNAP_MS) {
+		if (viewportResize.current || !initialLayoutDone.current || performance.now() - initialLayoutAt.current < INITIAL_SNAP_MS) {
+			if (viewportResize.current) cancelScrollFollow();
 			node.scrollTop = node.scrollHeight;
 			markWritten(node.scrollTop);
 			return;
 		}
 		followEnd();
-	}, [followEnd, markWritten]);
+	}, [followEnd, markWritten, cancelScrollFollow]);
 
 	const syncScrollLayout = useCallback(() => {
 		anchorGeometry.current = null;
@@ -3859,6 +3993,23 @@ export function Timeline({
 		}
 		updateScrollbar();
 	}, [syncPromptSpacer, updateScrollbar, glideToEnd, followOrSnapToEnd]);
+
+	const restoreViewportResize = useCallback(() => {
+		const resize = viewportResize.current;
+		const node = scroller.current;
+		if (!resize || !node || (virtualized && renderedVirtualHeight.current !== virtualizer.getTotalSize())) return;
+		syncPromptSpacer();
+		if (pinnedRef.current) followOrSnapToEnd(node);
+		else if (resize.anchor) {
+			const anchor = resize.anchor;
+			const row = virtualizer.measurementsCache.find((candidate) => candidate.key === anchor.key);
+			if (row) node.scrollTop = row.start - anchor.offset;
+		}
+		markWritten(node.scrollTop);
+		lastScrollTop.current = node.scrollTop;
+		viewportResize.current = undefined;
+		updateScrollbar();
+	}, [virtualized, virtualizer, syncPromptSpacer, followOrSnapToEnd, markWritten, updateScrollbar]);
 
 	// Streamed text grows the content without a new sequence. While following, let
 	// the reply fill the prompt spacer first (the view holds still), then follow the
@@ -3960,8 +4111,11 @@ export function Timeline({
 	useEffect(() => {
 		syncScrollLayout();
 	}, [pinned, snapshot.latestSequence, groups.length, messageEdit?.turnId, syncScrollLayout]);
+	useLayoutEffect(() => {
+		restoreViewportResize();
+	}, [virtualHeight, restoreViewportResize]);
 	useEffect(() => {
-		if (!virtualized) return;
+		if (!virtualized || viewportResize.current) return;
 		// Wait for measured sizes to reach the DOM before following new content.
 		// Resizing an already measured group only refreshes scroll metrics.
 		if (pendingVirtualLayout.current && virtualHeight === virtualizer.getTotalSize()) {
@@ -3989,17 +4143,24 @@ export function Timeline({
 	// down and re-arm the observer, which would re-run a full layout per chunk.
 	const onContentResize = useRef(syncScrollMetrics);
 	onContentResize.current = () => {
+		if (viewportResize.current) {
+			restoreViewportResize();
+			return;
+		}
 		if (pinnedRef.current) syncStreamedGrowth();
 		else syncScrollMetrics();
 	};
 	useEffect(() => {
 		syncScrollLayout();
 		if (typeof ResizeObserver === "undefined") return;
-		const observer = new ResizeObserver(() => onContentResize.current());
+		const observer = new ResizeObserver(() => {
+			captureViewportResize(virtualizer);
+			onContentResize.current();
+		});
 		if (scroller.current) observer.observe(scroller.current);
 		if (scrollContent.current) observer.observe(scrollContent.current);
 		return () => observer.disconnect();
-	}, [groups.length]);
+	}, [groups.length, captureViewportResize, virtualizer]);
 
 	// The pause-then-resume for a reader who only nudged up a little: armed by their
 	// scroll, re-armed by each further scroll, dropped once they go past the band or
@@ -4219,23 +4380,11 @@ export function Timeline({
 			// cannot invalidate the complete mounted conversation history or shell.
 			style={{ contain: "layout paint" }}
 		>
-			{selectionAction ? (
-				<div
-					ref={selectionButton}
-					style={{ left: selectionPosition?.left ?? 0, top: selectionPosition?.top ?? 0, visibility: selectionPosition?.visible ? "visible" : "hidden" }}
-					onMouseDown={(event) => event.preventDefault()}
-					className={cn(actionMenuContentClass, "absolute flex-row min-w-0 w-max max-w-full")}
-				>
-					<button type="button" onClick={() => void addSelectionToChat()} className={cn(actionMenuItemClass, "shrink-0 whitespace-nowrap hover:bg-interactive-hover hover:text-foreground")}>
-						<MessageSquarePlus aria-hidden="true" className="size-3.5" /> Add to chat
-					</button>
-					{onAddToSideChat ? <button type="button" className={cn(actionMenuItemClass, "shrink-0 whitespace-nowrap hover:bg-interactive-hover")} onClick={() => { void onAddToSideChat(selectionAction.excerpt); clearSelectionAction(); window.getSelection()?.removeAllRanges(); }}><MessageSquarePlus aria-hidden="true" className="size-3.5" /> {t("sideChat.addToSideChat")}</button> : null}
-				</div>
-			) : null}
+			{selectionAction ? <ChatSelectionActions key={selectionAction.excerpt.id} selection={selectionAction}
+				viewportRef={scroller} onInvalid={clearSelectionAction} onAdd={addSelectionToChat}
+				onSide={onAddToSideChat} checkingSide={checkingSideChatAvailability} /> : null}
 			<div
 				ref={scroller}
-				onMouseUp={captureTranscriptSelection}
-				onKeyUp={captureTranscriptSelection}
 				onScroll={onScroll}
 				onScrollEnd={endFlight}
 				onWheel={onViewportWheel}
@@ -4311,6 +4460,7 @@ export function Timeline({
 								<WorkerUpdateIndexContext.Provider value={workerUpdateIndex}>
 								<TurnGroup
 									group={group}
+									harness={snapshot.harness}
 									workerUpdates={workerUpdates}
 									// Consecutive quiet worker turns read as one list of rows, not separate turns.
 									tight={workerUpdates && isQuietWorkerGroup(group) && isQuietWorkerGroup(groups[index - 1])}
@@ -4364,14 +4514,14 @@ export function Timeline({
 					{/* Normally drawn inside the opening turn's group; this covers a start
 					    whose brief is not in the timeline. */}
 					{rowStartup && (openingSetup || showStartup) && !startupGroupKey ? (
-						<LiveResponseStatus startupLabel={t(rowStartup.failed ? "chat.startup.failed" : "chat.startup.running")} failed={rowStartup.failed}>
+						<LiveResponseStatus startupLabel={rowStartup.label ?? t(rowStartup.failed ? "chat.startup.failed" : "chat.startup.running")} failed={rowStartup.failed}>
 							{rowStartup.steps.length > 0 || rowStartup.failed ? <SessionStartup {...rowStartup} /> : null}
 						</LiveResponseStatus>
 					) : turn?.state === "running" && !groups.some((group) => group.turnId === turn.id) ? (
 						<LiveResponseStatus startedAt={turn.startedAt ?? turn.requestedAt} />
 					) : openingPending && !groups.some((group) => group.live) ? (
 						// Before the brief has a turn of its own (still being created).
-						<LiveResponseStatus startedAt={openingStartedAt} />
+						<LiveResponseStatus startedAt={openingStartedAt} startupLabel={openingStartupLabel} />
 					) : null}
 					{messageEdit && !editedMessageVisible ? (
 						<div className="flex justify-end" data-chat-scroll-anchor="">
@@ -4530,6 +4680,7 @@ export function Timeline({
  */
 const TurnGroup = memo(function TurnGroup({
 	group,
+	harness,
 	activityDisclosureOverrides,
 	onActivityDisclosureChange,
 	sessionId,
@@ -4567,6 +4718,7 @@ const TurnGroup = memo(function TurnGroup({
 	tight = false,
 }: {
 	group: TimelineGroup;
+	harness: string;
 	activityDisclosureOverrides: Readonly<Record<string, boolean>>;
 	onActivityDisclosureChange: (key: string, open: boolean) => void;
 	sessionId: string;
@@ -4603,11 +4755,12 @@ const TurnGroup = memo(function TurnGroup({
 	queued: boolean;
 	newHumanMessageIds: ReadonlySet<string>;
 	/** The opening turn of a starting session: its setup checklist. */
-	startup?: ComponentProps<typeof SessionStartup>;
+	startup?: ComponentProps<typeof SessionStartup> & { label?: string };
 	onSelectAnnotation?: (annotation: { text: string; messageId?: string; revision?: number }) => void;
 	workerUpdates?: boolean;
 	tight?: boolean;
 }) {
+	const hostId = useContext(ChatHostId);
 	const { t } = useTranslation();
 	const reducedMotion = useReducedMotion();
 	const hasTerminalFailure =
@@ -4776,7 +4929,7 @@ const TurnGroup = memo(function TurnGroup({
 		startup || group.live ? (
 			<LiveResponseStatus
 				startedAt={group.liveStartedAt}
-				startupLabel={startup ? t(startup.failed ? "chat.startup.failed" : "chat.startup.running") : undefined}
+				startupLabel={startup ? startup.label ?? t(startup.failed ? "chat.startup.failed" : "chat.startup.running") : group.liveStartupLabel}
 				failed={startup?.failed}
 				task={currentTask ? liveTaskLabel(currentTask) : undefined}
 				reconnect={group.liveProviderFailure ? reconnectCopy(group.liveProviderFailure) : undefined}
@@ -4896,6 +5049,10 @@ const TurnGroup = memo(function TurnGroup({
 				<TurnOutcome
 					state={group.outcome.state}
 					error={group.outcome.error}
+					failureCode={group.outcome.failureCode}
+					onConfigure={harness === "deepseek-harness" && group.outcome.failureCode === "provider_key_missing"
+						? () => useUiStore.getState().openGlobalSettings("harness", { focusAgentId: harness, ...(hostId ? { hostId } : {}), harnessView: "local", preserveProject: true, startLogin: true })
+						: undefined}
 					usageLimit={group.outcome.usageLimit}
 					retry={group.outcome.state === "failed" ? retry : undefined}
 					copyText={copyableMessage?.text}
@@ -5232,6 +5389,7 @@ function sameGroup(a: TimelineGroup, b: TimelineGroup): boolean {
 		a.anchor === b.anchor &&
 		a.turnId === b.turnId &&
 		a.live === b.live &&
+		a.liveStartupLabel === b.liveStartupLabel &&
 		a.rollbackable === b.rollbackable &&
 		sameContent(a.outcome, b.outcome) &&
 		sameContent(a.diff, b.diff) &&
@@ -5283,6 +5441,7 @@ type TimelineGroup = {
 		durationMs?: number;
 		error?: string;
 		usageLimit?: ConversationUsageLimit;
+		failureCode?: "provider_key_missing";
 	};
 	/** What the turn changed on disk, when the daemon reported anything. */
 	diff?: TurnDiff;
@@ -5291,6 +5450,8 @@ type TimelineGroup = {
 	/** The turn is still running, so its diff and plan can still change. */
 	live?: boolean;
 	liveStartedAt?: string;
+	/** Names the start in place of the timer, such as a Cloud sandbox still coming up. */
+	liveStartupLabel?: string;
 	blocked?: boolean;
 	/** A live provider failure replaces the generic Working label until the turn settles. */
 	liveProviderFailure?: ConversationActivity;
@@ -5508,6 +5669,7 @@ function groupByTurn(snapshot: ConversationSnapshot): TimelineGroup[] {
 					(item): item is ConversationActivity => item.kind === "activity" && item.activityKind === "error",
 				)?.summary
 				: undefined),
+			failureCode: turn.failureCode,
 		};
 	}
 
