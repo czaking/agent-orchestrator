@@ -243,13 +243,13 @@ function CueRunMenuTrigger({
 						aria-label={t("cues.run")}
 						// The menu is anchored to this button: pressing must not scale it,
 						// or the open menu shifts with the trigger.
-						className="topbar-control--static-press topbar-control--labeled aria-expanded:text-muted-foreground aria-expanded:hover:text-foreground"
+						className="topbar-control--static-press aria-expanded:text-muted-foreground aria-expanded:hover:text-foreground"
 						data-priority="secondary"
 						// The menu opens on hover, so "open" just means "hovered": keep
 						// the same hover highlight as the other top bar icons.
 						highlightActive={false}
 						disabled={disabled || spinner}
-						variant="action"
+						variant="icon"
 						onPointerEnter={handlePointerEnter}
 						onPointerLeave={handlePointerLeave}
 						// Keyboard activation opens the menu (Radix); only pointer
@@ -264,7 +264,6 @@ function CueRunMenuTrigger({
 						) : (
 							<Play className="size-icon-md" aria-hidden="true" />
 						)}
-						<span data-compact-label>{t("cues.runShort")}</span>
 					</TopbarButton>
 				</DropdownMenuTrigger>
 
