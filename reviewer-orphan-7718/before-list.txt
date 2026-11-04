@@ -1,7 +1,0 @@
-ao review ls demo-worker
-
-PR    STATUS         VERDICT    TITLE
-#42   running        -          Demo: orphaned reviewer recovery
-
-review_run run-demo: status=running body=""
-review row: harness=aider activity=active handle=""

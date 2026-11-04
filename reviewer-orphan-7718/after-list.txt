@@ -1,7 +1,0 @@
-ao review ls demo-worker
-
-PR    STATUS         VERDICT    TITLE
-#42   needs_review   -          Demo: orphaned reviewer recovery
-
-review_run run-demo: status=failed body="no reviewer process is attached to this review; the review run was failed"
-review row: harness=aider activity=exited handle=""

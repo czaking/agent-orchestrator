@@ -1,3 +1,0 @@
-ao review request demo-worker  # new pass on the same head
-
--> error: review: conflict: review already running: aider is already reviewing PR #42 head sha-demo; wait for its result, or pass --rerun to add another reviewer
